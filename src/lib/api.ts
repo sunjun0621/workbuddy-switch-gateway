@@ -1,0 +1,781 @@
+import { invoke } from "@tauri-apps/api/core";
+import type {
+  AccountMeta,
+  AccountRecord,
+  AppStatus,
+  AutoRotateConfig,
+  CodeBuddyCliInstallResult,
+  CodeBuddyCliStatus,
+  CodeBuddyCliSwitchResult,
+  CodeBuddyCnIdeStatus,
+  CodeBuddyCnIdeSwitchResult,
+  CheckinConfig,
+  CheckinLog,
+  CheckinResult,
+  CreditExpiry,
+  CreditStatistics,
+  TokenStatistics,
+  AccountRegionKey,
+  CopyResult,
+  AgentBackupItem,
+  AgentBatchImportResult,
+  AgentDetectionResult,
+  AgentImportResult,
+  AgentRestoreResult,
+  GatewayConfig,
+  GatewayConfigResult,
+  GatewayMode,
+  GatewayModeSwitchResult,
+  GatewayModelItem,
+  GatewayLogResult,
+  GatewayStartResult,
+  GatewayStatus,
+  GatewayPortCheck,
+  GatewaySyncResult,
+  GatewayUsageResult,
+  GithubConfig,
+  ImportPreviewAccount,
+  ImportResult,
+  LocalImportResult,
+  LocalScanResult,
+  OAuthPollResult,
+  OAuthStartResult,
+  RotateLog,
+  RotateStatus,
+  Session,
+  SwitchResult,
+  TravelConfig,
+  TravelStatus,
+  UpdateInfo,
+} from "./types";
+import { DEMO_UNAVAILABLE_MESSAGE, demoModeEnabled } from "./demo-mode";
+import { screenshotDemoResponse } from "./screenshot-demo";
+
+/**
+ * 双通道适配层：
+ * - 桌面 App（Tauri）：`invoke` 调用 Rust commands
+ * - webui（浏览器）：HTTP fetch 调用本地 workbuddy-switch 服务（127.0.0.1）
+ */
+const API_BASE = "http://127.0.0.1:57890";
+
+const DEMO_READ_COMMANDS = new Set([
+  "get_status", "get_accounts", "get_codebuddy_cli_status", "get_codebuddy_cn_ide_status", "get_checkin_status",
+  "get_credit_expiry", "get_credit_statistics", "get_auto_checkin_config",
+  "get_token_statistics",
+  "get_checkin_logs", "get_auto_rotate_config", "rotate_status", "get_rotate_logs",
+  "get_github_config", "check_update", "get_launch_at_login_enabled", "switch_progress",
+  "get_travel_status", "get_auto_travel_config",
+  "get_gateway_usage",
+]);
+
+export function isDemoMode(): boolean {
+  return demoModeEnabled;
+}
+
+export function isWebui(): boolean {
+  return typeof window !== "undefined" && !("__TAURI_INTERNALS__" in window);
+}
+
+/** Tauri mobile 也注入内部 API；用现有平台 UA 约定把桌面宿主与移动宿主区分开。 */
+function isMobilePlatform(): boolean {
+  if (typeof navigator === "undefined") return false;
+  const ua = navigator.userAgent;
+  return (
+    /Android|iPhone|iPad|iPod/i.test(ua) ||
+    (ua.includes("Macintosh") && navigator.maxTouchPoints > 1)
+  );
+}
+
+/** 是否为提供桌面专属能力的 Tauri 宿主。 */
+export function isDesktop(): boolean {
+  return !isWebui() && !isMobilePlatform();
+}
+
+type Route = { method: "GET" | "POST"; path: string };
+
+/** Tauri command → HTTP 路由映射（webui 模式）。 */
+const ROUTES: Record<string, Route> = {
+  get_status: { method: "GET", path: "/api/status" },
+  get_accounts: { method: "GET", path: "/api/accounts" },
+  get_codebuddy_cli_status: { method: "GET", path: "/api/codebuddy-cli/status" },
+  install_codebuddy_cli_helper: { method: "POST", path: "/api/codebuddy-cli/install-helper" },
+  switch_codebuddy_cli_account: { method: "POST", path: "/api/codebuddy-cli/switch" },
+  get_codebuddy_cn_ide_status: { method: "GET", path: "/api/codebuddy-cn-ide/status" },
+  switch_codebuddy_cn_ide_account: { method: "POST", path: "/api/codebuddy-cn-ide/switch" },
+  detect_codebuddy_cn_ide_account: { method: "POST", path: "/api/codebuddy-cn-ide/detect" },
+  delete_account: { method: "POST", path: "/api/delete" },
+  set_account_note: { method: "POST", path: "/api/accounts/note" },
+  oauth_start: { method: "POST", path: "/api/oauth/start" },
+  oauth_status: { method: "POST", path: "/api/oauth/status" },
+  import_local: { method: "POST", path: "/api/import-local" },
+  scan_local_accounts: { method: "GET", path: "/api/import-local/scan" },
+  import_local_selected: { method: "POST", path: "/api/import-local/selected" },
+  export_accounts: { method: "POST", path: "/api/export-accounts" },
+  export_accounts_to_path: { method: "POST", path: "/api/export-accounts-to-path" },
+  preview_import_accounts: { method: "POST", path: "/api/import/preview" },
+  import_accounts: { method: "POST", path: "/api/import" },
+  switch_account: { method: "POST", path: "/api/switch" },
+  list_sessions: { method: "GET", path: "/api/sessions" },
+  copy_sessions: { method: "POST", path: "/api/sessions/copy" },
+  get_checkin_status: { method: "GET", path: "/api/checkin/status" },
+  get_credit_expiry: { method: "POST", path: "/api/credits" },
+  get_credit_statistics: { method: "GET", path: "/api/credits/stats" },
+  get_token_statistics: { method: "GET", path: "/api/token-stats" },
+  checkin: { method: "POST", path: "/api/checkin" },
+  checkin_all: { method: "POST", path: "/api/checkin/all" },
+  get_auto_checkin_config: { method: "GET", path: "/api/checkin/config" },
+  save_auto_checkin_config: { method: "POST", path: "/api/checkin/config" },
+  get_checkin_logs: { method: "GET", path: "/api/checkin/logs" },
+  get_travel_status: { method: "GET", path: "/api/travel/status" },
+  travel_run: { method: "POST", path: "/api/travel/run" },
+  travel_adopt: { method: "POST", path: "/api/travel/adopt" },
+  get_auto_travel_config: { method: "GET", path: "/api/travel/config" },
+  save_auto_travel_config: { method: "POST", path: "/api/travel/config" },
+  get_auto_rotate_config: { method: "GET", path: "/api/rotate/config" },
+  save_auto_rotate_config: { method: "POST", path: "/api/rotate/config" },
+  rotate_status: { method: "GET", path: "/api/rotate/status" },
+  run_rotate: { method: "POST", path: "/api/rotate/run" },
+  get_rotate_logs: { method: "GET", path: "/api/rotate/logs" },
+  refresh_account_token: { method: "POST", path: "/api/refresh-token" },
+  get_github_config: { method: "GET", path: "/api/update/config" },
+  save_github_config: { method: "POST", path: "/api/update/config" },
+  check_update: { method: "GET", path: "/api/update/check" },
+  switch_progress: { method: "GET", path: "/api/switch/progress" },
+  // ---- 网关（workbuddy2api）集成 ----
+  get_gateway_status: { method: "GET", path: "/api/gateway/status" },
+  get_gateway_config: { method: "GET", path: "/api/gateway/config" },
+  save_gateway_config: { method: "POST", path: "/api/gateway/config" },
+  switch_gateway_mode: { method: "POST", path: "/api/gateway/mode" },
+  set_allowed_model: { method: "POST", path: "/api/gateway/allowed-model" },
+  start_gateway: { method: "POST", path: "/api/gateway/start" },
+  check_gateway_port: { method: "POST", path: "/api/gateway/port-check" },
+  stop_gateway: { method: "POST", path: "/api/gateway/stop" },
+  restart_gateway: { method: "POST", path: "/api/gateway/restart" },
+  sync_gateway_accounts: { method: "POST", path: "/api/gateway/sync" },
+  get_gateway_models: { method: "GET", path: "/api/gateway/models" },
+  get_gateway_usage: { method: "GET", path: "/api/gateway/usage" },
+  read_gateway_log: { method: "GET", path: "/api/gateway/log" },
+  // ---- 一键导入：接入本机 AI 客户端 ----
+  detect_agent_clients: { method: "GET", path: "/api/gateway/agents" },
+  import_agent_client: { method: "POST", path: "/api/gateway/agents/import" },
+  batch_import_agent_clients: { method: "POST", path: "/api/gateway/agents/batch-import" },
+  restore_agent_client: { method: "POST", path: "/api/gateway/agents/restore" },
+  list_agent_backups: { method: "GET", path: "/api/gateway/agents/backups" },
+};
+
+function queryString(args?: Record<string, unknown>): string {
+  if (!args) return "";
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(args)) {
+    if (value === undefined || value === null) continue;
+    params.set(key, String(value));
+  }
+  const text = params.toString();
+  return text ? `?${text}` : "";
+}
+
+async function httpCall<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+  const route = ROUTES[cmd];
+  if (!route) throw new Error(`webui 模式暂不支持该操作: ${cmd}`);
+  let res: Response;
+  try {
+    const url =
+      route.method === "GET"
+        ? `${API_BASE}${route.path}${queryString(args)}`
+        : `${API_BASE}${route.path}`;
+    res = await fetch(url, {
+      method: route.method,
+      headers: { "Content-Type": "application/json" },
+      body: route.method === "POST" ? JSON.stringify(args ?? {}) : undefined,
+    });
+  } catch {
+    throw new Error(`无法连接 workbuddy-switch 服务（${API_BASE}），请先运行 \`workbuddy-switch\``);
+  }
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(data.message || data.error || `请求失败 (${res.status})`);
+  }
+  return data as T;
+}
+
+async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+  if (demoModeEnabled) {
+    if (cmd === "get_credit_statistics" && args?.refresh === true) {
+      throw new Error(DEMO_UNAVAILABLE_MESSAGE);
+    }
+    if (!DEMO_READ_COMMANDS.has(cmd)) throw new Error(DEMO_UNAVAILABLE_MESSAGE);
+    return screenshotDemoResponse(cmd, args) as T;
+  }
+  if (!isWebui()) return invoke<T>(cmd, args);
+  return httpCall<T>(cmd, args);
+}
+
+// ---------------------------------------------------------------------------
+// 状态 / 账号
+// ---------------------------------------------------------------------------
+
+export function getStatus(): Promise<AppStatus> {
+  return call("get_status");
+}
+
+export function getAccounts(): Promise<{ accounts: AccountMeta[] }> {
+  return call("get_accounts");
+}
+
+export function getCodebuddyCliStatus(): Promise<CodeBuddyCliStatus> {
+  return call("get_codebuddy_cli_status");
+}
+
+export function installCodebuddyCliHelper(): Promise<CodeBuddyCliInstallResult> {
+  return call("install_codebuddy_cli_helper");
+}
+
+export function switchCodebuddyCliAccount(accountId: string): Promise<CodeBuddyCliSwitchResult> {
+  if (demoModeEnabled) {
+    return new Promise((resolve, reject) => {
+      window.setTimeout(() => {
+        try {
+          resolve(screenshotDemoResponse("switch_codebuddy_cli_account", { accountId }) as CodeBuddyCliSwitchResult);
+        } catch (error) {
+          reject(error);
+        }
+      }, 1200);
+    });
+  }
+  return call("switch_codebuddy_cli_account", { accountId });
+}
+
+export function getCodebuddyCnIdeStatus(): Promise<CodeBuddyCnIdeStatus> {
+  return call("get_codebuddy_cn_ide_status");
+}
+
+export function switchCodebuddyCnIdeAccount(
+  accountId: string,
+  restart = true,
+): Promise<CodeBuddyCnIdeSwitchResult> {
+  return call("switch_codebuddy_cn_ide_account", { accountId, restart });
+}
+
+export function detectCodebuddyCnIdeAccount(): Promise<{
+  ok: boolean;
+  found: boolean;
+  matched?: boolean;
+  accountId?: string;
+  message?: string;
+}> {
+  return call("detect_codebuddy_cn_ide_account");
+}
+
+
+export function deleteAccount(accountId: string): Promise<{ ok: boolean }> {
+  return call("delete_account", { accountId });
+}
+
+/**
+ * 设置账号备注（空串 = 清除）。
+ *
+ * 备注只存本地账号库，不参与登录；用于认出「这是谁的号、干什么用的」。
+ * 返回更新后的 AccountMeta，调用方可直接用它刷新界面。
+ */
+export function setAccountNote(
+  accountId: string,
+  note: string,
+): Promise<{ ok: boolean; account: AccountMeta }> {
+  return call("set_account_note", { accountId, note });
+}
+
+/**
+ * 发起 OAuth 登录（国服扫码 / 国际版三方授权）。
+ *
+ * `region` 决定取 state 的域名与平台标识（国服 `workbuddy` / 国际版
+ * `workbuddy-ai`）；缺省国服，与旧调用兼容。
+ */
+export function oauthStart(region: AccountRegionKey = "cn"): Promise<OAuthStartResult> {
+  return call("oauth_start", { region });
+}
+
+export function oauthStatus(loginId: string): Promise<OAuthPollResult> {
+  return call("oauth_status", { loginId });
+}
+
+/**
+ * 从本机导入账号。
+ *
+ * 会同时探测国服与国际版两个认证文件，把能读到的账号全部并入账号库；
+ * `account` 为首个账号（兼容旧调用方），`accounts` 为本次全部结果。
+ */
+export function importLocal(): Promise<{
+  ok: boolean;
+  account: AccountMeta | null;
+  accounts: AccountMeta[];
+  imported: number;
+}> {
+  return call("import_local");
+}
+
+/**
+ * 扫描本机全部历史登录态（当前认证文件 + 客户端快照 + 本工具备份）。
+ *
+ * 「导入本机账号」原本只看两个固定认证文件，因此每区域最多 1 个账号；
+ * 本接口额外扫出历史快照，按「区域 + uid」去重后只保留凭证最新的一份。
+ */
+export function scanLocalAccounts(): Promise<LocalScanResult> {
+  return call("scan_local_accounts", {});
+}
+
+/** 按来源文件路径批量导入本机账号（路径跨扫描稳定，优于索引）。 */
+export function importLocalSelected(paths: string[]): Promise<LocalImportResult> {
+  return call("import_local_selected", { paths, indexes: [] });
+}
+
+export function exportAccounts(accountIds: string[]): Promise<{ ok: boolean; accounts: AccountRecord[] }> {
+  return call("export_accounts", { accountIds });
+}
+
+/** 桌面端：把完整记录写入用户选择的路径（系统保存对话框产物）。 */
+export function exportAccountsToPath(
+  accountIds: string[],
+  path: string,
+): Promise<{ ok: boolean; path: string }> {
+  return call("export_accounts_to_path", { accountIds, path });
+}
+
+export function previewImportAccounts(
+  fileText: string,
+): Promise<{ accounts: ImportPreviewAccount[]; total: number }> {
+  return call("preview_import_accounts", { fileText });
+}
+
+export function importAccounts(fileText: string, indexes: number[]): Promise<ImportResult> {
+  return call("import_accounts", { fileText, indexes });
+}
+
+export function switchAccount(args: {
+  accountId: string;
+  restart?: boolean;
+  shareSessions?: boolean;
+  copySessionIds?: string[];
+}): Promise<SwitchResult> {
+  return call("switch_account", args as unknown as Record<string, unknown>);
+}
+
+/** 切换进度（webui 轮询用；桌面端走事件，此函数无副作用）。 */
+export function switchProgress(): Promise<{ running: boolean; progress: string | null }> {
+  return call("switch_progress");
+}
+
+export function listSessions(): Promise<{
+  sessions: Session[];
+  current: string | null;
+}> {
+  return call("list_sessions");
+}
+
+export function copySessions(
+  targetAccountId: string,
+  sessionIds: string[],
+): Promise<{ sourceUid: string; targetUid: string; copied: CopyResult[] }> {
+  return call("copy_sessions", { targetAccountId, sessionIds });
+}
+
+/** 打开系统设置授权面板（桌面端专用；webui 模式由服务进程权限决定，无操作）。 */
+export function openPermissionSettings(
+  target?: "app_management" | "all_files",
+): Promise<void> {
+  if (demoModeEnabled) return Promise.reject(new Error(DEMO_UNAVAILABLE_MESSAGE));
+  if (isWebui()) return Promise.resolve();
+  return call("open_permission_settings", { target: target ?? "app_management" });
+}
+
+/** 权限自检：桌面端写探针；webui 模式由服务进程权限决定。 */
+export function checkAuthPermission(): Promise<{
+  ok: boolean;
+  message?: string;
+  error?: string;
+  dir?: string;
+  hint?: string;
+}> {
+  if (demoModeEnabled) return Promise.reject(new Error(DEMO_UNAVAILABLE_MESSAGE));
+  if (isWebui()) {
+    return Promise.resolve({
+      ok: true,
+      message: "webui 模式由服务进程（终端启动）的权限决定，无需额外授权",
+      hint: "",
+    });
+  }
+  return call("check_auth_permission");
+}
+
+/** 在 Finder 中显示当前 App（桌面端专用；webui 无操作）。 */
+export function revealAppInFinder(): Promise<void> {
+  if (demoModeEnabled) return Promise.reject(new Error(DEMO_UNAVAILABLE_MESSAGE));
+  if (isWebui()) return Promise.resolve();
+  return call("reveal_app_in_finder");
+}
+
+// ---------------------------------------------------------------------------
+// 阶段 3：签到 + token 刷新
+// ---------------------------------------------------------------------------
+
+export async function getCheckinStatus(accountId: string): Promise<{
+  ok: boolean;
+  todayCheckedIn: boolean;
+  error?: string;
+  raw?: unknown;
+}> {
+  if (demoModeEnabled) {
+    return screenshotDemoResponse("get_checkin_status", { accountId }) as {
+      ok: boolean;
+      todayCheckedIn: boolean;
+      error?: string;
+      raw?: unknown;
+    };
+  }
+  if (isWebui()) {
+    // webui 端为批量接口，按 accountId 过滤
+    const all = await httpCall<{
+      accounts: {
+        accountId: string;
+        email: string;
+        ok: boolean;
+        todayCheckedIn: boolean;
+        error?: string;
+        raw?: unknown;
+      }[];
+    }>("get_checkin_status");
+    const one = all.accounts.find((a) => a.accountId === accountId);
+    return one
+      ? { ok: one.ok, todayCheckedIn: one.todayCheckedIn, error: one.error, raw: one.raw }
+      : { ok: false, todayCheckedIn: false, error: "未找到账号" };
+  }
+  return call("get_checkin_status", { accountId });
+}
+
+export function getCreditExpiry(accountId: string): Promise<CreditExpiry> {
+  return call("get_credit_expiry", { accountId });
+}
+
+export function getCreditStatistics(refresh = false): Promise<CreditStatistics> {
+  return call("get_credit_statistics", refresh ? { refresh: true } : undefined);
+}
+
+export function getTokenStatistics(days?: number): Promise<TokenStatistics> { return call("get_token_statistics", days ? { days } : undefined); }
+
+export function checkin(accountId: string): Promise<CheckinResult> {
+  return call("checkin", { accountId });
+}
+
+export function checkinAll(): Promise<{
+  accounts: { accountId: string; email: string; result: string; error?: string }[];
+  status?: string;
+  reason?: string;
+}> {
+  return call("checkin_all");
+}
+
+/** 一键旅行：全部账号走一趟巡检（含领养、派出、领奖）。不受「自动旅行」开关限制。 */
+export function travelRun(): Promise<{
+  status: string;
+  reason?: string;
+  completed?: boolean;
+  accounts?: { accountId: string; email: string; result: string; skip?: string | null; message?: string | null }[];
+}> {
+  return call("travel_run");
+}
+
+/** 单账号领养：只领养 Buddy，不派猫、不领奖。 */
+export function travelAdopt(accountId: string): Promise<{
+  ok: boolean;
+  skip?: string;
+  message?: string;
+}> {
+  return call("travel_adopt", { accountId });
+}
+
+export function getAutoCheckinConfig(): Promise<CheckinConfig> {
+  return call("get_auto_checkin_config");
+}
+
+export function saveAutoCheckinConfig(config: CheckinConfig): Promise<CheckinConfig> {
+  return call("save_auto_checkin_config", {
+    config: config as unknown as Record<string, unknown>,
+  });
+}
+
+export function getCheckinLogs(): Promise<{ logs: CheckinLog[] }> {
+  return call("get_checkin_logs");
+}
+
+export async function getTravelStatus(accountId: string): Promise<TravelStatus> {
+  if (demoModeEnabled) {
+    return screenshotDemoResponse("get_travel_status", { accountId }) as TravelStatus;
+  }
+  if (isWebui()) {
+    // webui 端为批量接口，按 accountId 过滤
+    const all = await httpCall<{
+      accounts: { accountId: string; email: string; label: TravelStatus["label"]; rewardCredit: number | null; locationName?: string | null; arriveAt?: number | null }[];
+    }>("get_travel_status");
+    const one = all.accounts.find((a) => a.accountId === accountId);
+    return one
+      ? { label: one.label, rewardCredit: one.rewardCredit, locationName: one.locationName ?? null, arriveAt: one.arriveAt ?? null }
+      : { label: "untraveled", rewardCredit: null, locationName: null, arriveAt: null };
+  }
+  return call("get_travel_status", { accountId });
+}
+
+export function getAutoTravelConfig(): Promise<TravelConfig> {
+  return call("get_auto_travel_config");
+}
+
+export function saveAutoTravelConfig(config: TravelConfig): Promise<TravelConfig> {
+  return call("save_auto_travel_config", {
+    config: config as unknown as Record<string, unknown>,
+  });
+}
+
+export function getAutoRotateConfig(): Promise<AutoRotateConfig> {
+  return call("get_auto_rotate_config");
+}
+
+export function saveAutoRotateConfig(config: AutoRotateConfig): Promise<AutoRotateConfig> {
+  return call("save_auto_rotate_config", {
+    config: config as unknown as Record<string, unknown>,
+  });
+}
+
+export function getRotateStatus(): Promise<RotateStatus> {
+  return call("rotate_status");
+}
+
+export function runRotate(): Promise<{ status: string; reason?: string; error?: string; to?: string }> {
+  return call("run_rotate");
+}
+
+export function getRotateLogs(): Promise<{ logs: RotateLog[] }> {
+  return call("get_rotate_logs");
+}
+
+export function refreshAccountToken(accountId: string): Promise<AccountMeta> {
+  return call("refresh_account_token", { accountId });
+}
+
+// ---------------------------------------------------------------------------
+// 阶段 4：自动更新
+// ---------------------------------------------------------------------------
+
+export function getGithubConfig(): Promise<GithubConfig> {
+  return call("get_github_config");
+}
+
+export function saveGithubConfig(config: GithubConfig): Promise<GithubConfig> {
+  return call("save_github_config", {
+    config: config as unknown as Record<string, unknown>,
+  });
+}
+
+export function checkUpdate(proxy?: string, force?: boolean): Promise<UpdateInfo> {
+  return call("check_update", { proxy: proxy?.trim() || null, force: force ?? false });
+}
+
+export function relaunchApp(): Promise<void> {
+  return call("relaunch_app");
+}
+
+// ---------------------------------------------------------------------------
+// 开机自启（仅桌面端；webui 不提供同名接口，卡片也不在 webui 渲染）
+// ---------------------------------------------------------------------------
+
+/** 查询系统当前的开机自启注册状态（桌面端）。 */
+export function getLaunchAtLoginEnabled(): Promise<boolean> {
+  if (demoModeEnabled) return call("get_launch_at_login_enabled");
+  if (!isDesktop()) return Promise.resolve(false);
+  return call("get_launch_at_login_enabled");
+}
+
+/** 注册 / 移除系统开机自启，返回回读后的权威状态（桌面端）。 */
+export function setLaunchAtLoginEnabled(enabled: boolean): Promise<boolean> {
+  if (demoModeEnabled) return Promise.reject(new Error(DEMO_UNAVAILABLE_MESSAGE));
+  if (!isDesktop()) return Promise.resolve(false);
+  return call("set_launch_at_login_enabled", { enabled });
+}
+
+/** 把 Tauri command / HTTP 抛出的错误统一为 Error。 */
+export function asError(e: unknown): string {
+  if (typeof e === "string") return e;
+  if (e instanceof Error) return e.message;
+  return JSON.stringify(e ?? "未知错误");
+}
+
+// ---------------------------------------------------------------------------
+// 网关（workbuddy2api）集成
+// ---------------------------------------------------------------------------
+
+/** 读取网关运行态（含账号池详情）。 */
+export function getGatewayStatus(): Promise<GatewayStatus> {
+  return call<GatewayStatus>("get_gateway_status");
+}
+
+/** 读取网关配置。 */
+export function getGatewayConfig(): Promise<GatewayConfigResult> {
+  return call<GatewayConfigResult>("get_gateway_config");
+}
+
+/**
+ * 保存网关配置。
+ *
+ * 显式把 snake_case 字段转成 camelCase：Tauri 的 `invoke` 按
+ * `#[tauri::command(rename_all = "camelCase")]` 取值，直接透传
+ * `api_key` / `auto_start` 会被静默丢弃（webui 的 HTTP 版则兼容两种写法）。
+ */
+export function saveGatewayConfig(config: Partial<GatewayConfig>): Promise<{ config: GatewayConfig }> {
+  const args: Record<string, unknown> = {};
+  if (config.port !== undefined) args.port = config.port;
+  if (config.api_key !== undefined) args.apiKey = config.api_key;
+  if (config.auto_start !== undefined) args.autoStart = config.auto_start;
+  if (config.mode !== undefined) args.mode = config.mode;
+  if (config.pinned_uid !== undefined) args.pinnedUid = config.pinned_uid;
+  return call<{ config: GatewayConfig }>("save_gateway_config", args);
+}
+
+/** 启动网关（会把账号库导出为网关凭证）。传 port 可一步指定端口并保存。 */
+export function startGateway(port?: number): Promise<GatewayStartResult> {
+  return call<GatewayStartResult>("start_gateway", port ? { port } : {});
+}
+
+/** 检测端口是否可用；被占用时返回建议端口。 */
+export function checkGatewayPort(port: number): Promise<GatewayPortCheck> {
+  return call<GatewayPortCheck>("check_gateway_port", { port });
+}
+
+/** 停止网关。 */
+export function stopGateway(): Promise<{ stopped: boolean }> {
+  return call<{ stopped: boolean }>("stop_gateway");
+}
+
+/** 重启网关，使新配置/新账号生效。 */
+export function restartGateway(): Promise<GatewayStartResult> {
+  return call<GatewayStartResult>("restart_gateway");
+}
+
+/** 手动触发账号双向同步。 */
+export function syncGatewayAccounts(autoReload = true): Promise<GatewaySyncResult> {
+  return call<GatewaySyncResult>("sync_gateway_accounts", { autoReload });
+}
+
+/**
+ * 切换网关工作模式并立即生效。
+ *
+ * 与 saveGatewayConfig 的区别：那个只写配置文件，而网关账号池是启动时建立的，
+ * 因此改完必须手动重启才生效。此接口把「保存 + 重导出凭证 + 按需重启」合成一步。
+ */
+export function switchGatewayMode(
+  mode: GatewayMode,
+  pinnedUid?: string | null,
+): Promise<GatewayModeSwitchResult> {
+  return call<GatewayModeSwitchResult>("switch_gateway_mode", {
+    mode,
+    pinnedUid: pinnedUid ?? null,
+  });
+}
+
+/**
+ * 设置「单一模型 + 积分轮转」的目标模型；传空串清除锁定。
+ *
+ * 网关运行时后端会自动重启它以生效（模型锁定由网关启动时读取）。
+ */
+export function setAllowedModel(model: string): Promise<GatewayModeSwitchResult> {
+  return call<GatewayModeSwitchResult>("set_allowed_model", { model });
+}
+
+// ---------------------------------------------------------------------------
+// 一键导入：接入本机 AI 客户端
+// ---------------------------------------------------------------------------
+
+/** 获取网关可用模型列表（优先动态查询网关，网关未就绪时回退静态并集）。 */
+export async function getGatewayModels(): Promise<GatewayModelItem[]> {
+  const res = await call<{ models?: GatewayModelItem[] }>("get_gateway_models");
+  return res.models ?? [];
+}
+
+/**
+ * 获取网关累计 Token 用量统计（网关自统计，重启保留）。
+ *
+ * `days` 省略或非正数 = 全部历史；网关未运行 / 不可达时也不抛错，
+ * 由返回的 running / reachable / error 字段区分状态。
+ */
+export function getGatewayUsage(days?: number): Promise<GatewayUsageResult> {
+  return call<GatewayUsageResult>("get_gateway_usage", days && days > 0 ? { days } : undefined);
+}
+
+/**
+ * 读取网关日志末尾若干行（内置面板用）。
+ *
+ * 只读尾部：单份日志上限 5 MB，全量读既慢又没必要 —— 排查看的是最后一次请求。
+ * `truncated=true` 表示这里只给了尾部，完整内容需打开文件（配合 `revealGatewayLog`）。
+ */
+export function readGatewayLog(maxLines = 500): Promise<GatewayLogResult> {
+  return call<GatewayLogResult>("read_gateway_log", { maxLines });
+}
+
+/**
+ * 在文件管理器中定位网关日志文件（桌面端专用；webui 由用户自行打开路径）。
+ *
+ * 文件尚不存在时定位到所在目录，避免「点了没反应」。
+ */
+export function revealGatewayLog(): Promise<{ path: string; exists: boolean; revealed: string }> {
+  if (demoModeEnabled) return Promise.reject(new Error(DEMO_UNAVAILABLE_MESSAGE));
+  if (isWebui()) {
+    // webui 是浏览器环境，无法操作宿主文件管理器：把路径交给调用方提示用户手动打开。
+    return Promise.resolve({ path: "", exists: false, revealed: "" });
+  }
+  return call<{ path: string; exists: boolean; revealed: string }>("reveal_gateway_log");
+}
+
+/** 探测本机 AI 客户端（全部 11 类智能体）的安装与配置状态。 */
+export function detectAgentClients(): Promise<AgentDetectionResult> {
+  return call<AgentDetectionResult>("detect_agent_clients");
+}
+
+/** 将本网关配置一键接入指定的客户端（支持单模型或多选模型）。 */
+export function importAgentClient(
+  target: string,
+  models?: string[] | string,
+): Promise<AgentImportResult> {
+  const modelList = Array.isArray(models)
+    ? models
+    : typeof models === "string" && models.trim()
+      ? [models.trim()]
+      : undefined;
+  return call<AgentImportResult>("import_agent_client", {
+    target,
+    models: modelList,
+    model: modelList?.[0],
+  });
+}
+
+/** 批量一键接入/更新多个客户端。若不传 targets，则自动更新所有已检测到安装的客户端。 */
+export function batchImportAgentClients(
+  targets?: string[],
+  models?: string[],
+): Promise<AgentBatchImportResult> {
+  return call<AgentBatchImportResult>("batch_import_agent_clients", {
+    targets,
+    models,
+  });
+}
+
+/** 回滚指定客户端至导入前的配置备份。 */
+export function restoreAgentClient(
+  target: string,
+  backupId?: string,
+): Promise<AgentRestoreResult> {
+  return call<AgentRestoreResult>("restore_agent_client", { target, backupId });
+}
+
+/** 查询指定客户端的历史配置备份列表。 */
+export function listAgentBackups(
+  target: string,
+): Promise<{ backups: AgentBackupItem[] }> {
+  return call<{ backups: AgentBackupItem[] }>("list_agent_backups", { target });
+}
+

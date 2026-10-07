@@ -1,0 +1,247 @@
+// Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
+mod commands;
+#[cfg(desktop)]
+mod tray;
+
+use std::time::Duration;
+#[cfg(desktop)]
+use tauri::Manager;
+use wb_switch_core::modules;
+
+const SCREENSHOT_DEMO_ENV: &str = "WB_SWITCH_SCREENSHOT_DEMO";
+
+pub(crate) fn is_screenshot_demo() -> bool {
+    std::env::var(SCREENSHOT_DEMO_ENV).as_deref() == Ok("1")
+}
+
+/// 后台循环：自动签到启动即核验、每 30 分钟补签；自动轮换每 30 秒检查；每天一次保活。
+fn spawn_background_loops() {
+    tauri::async_runtime::spawn(async move {
+        if let Err(error) = modules::config::compact_checkin_logs() {
+            eprintln!("[签到] 历史日志整理失败: {error}");
+        }
+        let _ =
+            modules::checkin::run_checkin_cycle(modules::checkin::CheckinCycleMode::StartupVerify)
+                .await;
+        loop {
+            tokio::time::sleep(modules::checkin::CHECKIN_RECOVERY_INTERVAL).await;
+            let _ = modules::checkin::run_checkin_cycle(
+                modules::checkin::CheckinCycleMode::PeriodicRecovery,
+            )
+            .await;
+        }
+    });
+
+    // 派猫猫旅行：启动即派发，之后周期性补派（并重试 no-buddy / 瞬时错误）。
+    tauri::async_runtime::spawn(async move {
+        let _ = modules::travel::run_travel_cycle().await;
+        loop {
+            tokio::time::sleep(modules::travel::TRAVEL_RETRY_INTERVAL).await;
+            let _ = modules::travel::run_travel_cycle().await;
+        }
+    });
+
+    // 旅行领取：启动立刻查一轮（避免重启后空等 15 分钟漏领），之后按周期检查。
+    tauri::async_runtime::spawn(async move {
+        let _ = modules::travel::run_travel_claim_cycle().await;
+        loop {
+            tokio::time::sleep(modules::travel::TRAVEL_CLAIM_INTERVAL).await;
+            let _ = modules::travel::run_travel_claim_cycle().await;
+        }
+    });
+
+    tauri::async_runtime::spawn(async move {
+        let mut last_keepalive_day = String::new();
+        let mut last_rotate_at: i64 = 0;
+        loop {
+            // 自动轮换（CodeBuddy CLI）：按配置间隔执行
+            let rotate_cfg = modules::config::load_auto_rotate_config();
+            if rotate_cfg.get("enabled").and_then(|v| v.as_bool()) == Some(true) {
+                let interval_minutes = rotate_cfg
+                    .get("check_interval_minutes")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(5)
+                    .max(1);
+                let now = modules::config::now_ms();
+                if now - last_rotate_at >= interval_minutes * 60_000 {
+                    last_rotate_at = now;
+                    let _ = modules::rotate::run_rotate_cycle().await;
+                }
+            }
+            let today = modules::checkin::date_str(None);
+            if today != last_keepalive_day {
+                last_keepalive_day = today;
+                let _ = modules::refresh::run_keepalive_cycle().await;
+            }
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        }
+    });
+    // 账号库 → 网关 自动同步：新增/变更账号会自动进入网关凭证目录，
+    // 网关运行中则自动重启以加载，无需用户手动点「立即同步」。
+    tauri::async_runtime::spawn(async move {
+        // 先清理旧版本因网络失败误报的「需重新登录」标记，再开始同步，
+        // 否则这些账号会一直留在网关凭证目录之外。
+        let repaired = modules::refresh::repair_false_relogin_flags();
+        if repaired > 0 {
+            eprintln!("[refresh] 已清除 {repaired} 个账号因网络失败误报的「需重新登录」标记");
+        }
+        modules::gateway::run_auto_sync_loop(30).await;
+    });
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    let mut builder = tauri::Builder::default();
+
+    // 单实例保护：必须最先注册，让第二个实例在做任何事之前就退出。
+    //
+    // 不加保护时多开会造成真实损坏：
+    //   1. 每个实例都会启动 8 个后台任务（签到/保活/轮换/旅行/网关同步），
+    //      并发写同一个 accounts.json → 后写覆盖先写，token 可能被旧值覆盖；
+    //   2. 网关子进程状态是进程内静态变量，实例 A 不知道实例 B 起过网关，
+    //      两边各自启停 → 端口冲突、进程泄漏、孤儿进程；
+    //   3. 托盘出现多个图标，用户无法分辨。
+    //
+    // 第二次启动改为「聚焦已有窗口」，符合用户直觉。
+    #[cfg(desktop)]
+    {
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            // 系统自启（--hidden）重复触发时不弹窗打扰
+            if tray::is_silent_startup(args.iter()) {
+                return;
+            }
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            }
+        }));
+    }
+
+    builder = builder
+        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_dialog::init());
+
+    #[cfg(desktop)]
+    {
+        builder = builder.plugin(tauri_plugin_autostart::init(
+            // 该参数仅在 macOS 生效（走 LaunchAgent）；Windows 上忽略，
+            // 但它是插件 init 的必填参数，故保留。
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            Some(vec![tray::SILENT_STARTUP_ARG]),
+        ));
+        builder = builder.on_window_event(tray::on_window_event);
+    }
+
+    let app = builder
+        .setup(|app| {
+            #[cfg(desktop)]
+            {
+                tray::setup(app)?;
+                // 主窗口由配置创建为不可见；在事件循环呈现前决定本次启动是否静默。
+                // 仅系统自启（精确 `--hidden` 参数）进入静默托盘，普通启动立即显示主窗口。
+                tray::setup_startup_visibility(
+                    app.handle(),
+                    tray::is_silent_startup(std::env::args()),
+                );
+            }
+            // README 截图模式只渲染前端虚构数据，禁止读取账号后执行签到、轮换或保活。
+            if !is_screenshot_demo() {
+                spawn_background_loops();
+                // 网关「随 App 启动」：读 auto_start，为真则在此拉起网关子进程。
+                //
+                // 必须放在 setup 里（事件循环之前）：用户勾选后重启 App 就该看到网关跑起来，
+                // 而不是等前端页面加载完再补启动 —— 后者在「启动后直接进托盘、从不打开
+                // 主窗口」的场景下永远不会发生。
+                tauri::async_runtime::spawn(async move {
+                    if let Some(v) = modules::gateway::maybe_autostart().await {
+                        let _ = v;
+                    }
+                });
+            }
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            commands::get_status,
+            commands::get_accounts,
+            commands::get_codebuddy_cli_status,
+            commands::install_codebuddy_cli_helper,
+            commands::switch_codebuddy_cli_account,
+            commands::get_codebuddy_cn_ide_status,
+            commands::switch_codebuddy_cn_ide_account,
+            commands::detect_codebuddy_cn_ide_account,
+            commands::delete_account,
+            commands::set_account_note,
+            commands::oauth_start,
+            commands::oauth_status,
+            commands::import_local,
+            commands::scan_local_accounts,
+            commands::import_local_selected,
+            commands::export_accounts,
+            commands::export_accounts_to_path,
+            commands::preview_import_accounts,
+            commands::import_accounts,
+            commands::switch_account,
+            commands::list_sessions,
+            commands::copy_sessions,
+            commands::open_permission_settings,
+            commands::check_auth_permission,
+            commands::reveal_app_in_finder,
+            commands::get_checkin_status,
+            commands::get_credit_expiry,
+            commands::get_credit_statistics,
+            commands::get_token_statistics,
+            commands::checkin,
+            commands::checkin_all,
+            commands::travel_run,
+            commands::travel_adopt,
+            commands::get_auto_checkin_config,
+            commands::save_auto_checkin_config,
+            commands::get_checkin_logs,
+            commands::get_travel_status,
+            commands::get_auto_travel_config,
+            commands::save_auto_travel_config,
+            commands::refresh_account_token,
+            commands::get_auto_rotate_config,
+            commands::save_auto_rotate_config,
+            commands::rotate_status,
+            commands::run_rotate,
+            commands::get_rotate_logs,
+            commands::get_github_config,
+            commands::save_github_config,
+            commands::check_update,
+            commands::relaunch_app,
+            commands::get_launch_at_login_enabled,
+            commands::set_launch_at_login_enabled,
+            // 兼容网关
+            commands::get_gateway_status,
+            commands::get_gateway_config,
+            commands::save_gateway_config,
+            commands::check_gateway_port,
+            commands::switch_gateway_mode,
+            commands::set_allowed_model,
+            commands::start_gateway,
+            commands::stop_gateway,
+            commands::restart_gateway,
+            commands::sync_gateway_accounts,
+            commands::get_gateway_usage,
+            commands::read_gateway_log,
+            commands::reveal_gateway_log,
+            // 一键导入：接入本机 AI 客户端
+            commands::detect_agent_clients,
+            commands::get_gateway_models,
+            commands::import_agent_client,
+            commands::batch_import_agent_clients,
+            commands::restore_agent_client,
+            commands::list_agent_backups,
+        ])
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    app.run(|_app_handle, event| {
+        #[cfg(desktop)]
+        tray::on_run_event(event);
+    });
+}
